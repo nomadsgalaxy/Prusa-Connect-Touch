@@ -186,3 +186,12 @@ void printer_store_remove(int idx)
     }
     UNLOCK();
 }
+
+void printer_store_clear(void)
+{
+    LOCK();
+    s_count = 0;
+    s_active = -1;
+    save_locked();
+    UNLOCK();
+}

@@ -22,3 +22,4 @@ void printer_store_set_active(int idx);                 /* persists             
 int  printer_store_add(const pp_printer_t *p);          /* idx or -1; persists      */
 bool printer_store_update(int idx, const pp_printer_t *p); /* edit in place; persists */
 void printer_store_remove(int idx);                     /* persists                 */
+void printer_store_clear(void);                          /* persists (wipes all)     */

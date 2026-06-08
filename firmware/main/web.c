@@ -63,7 +63,11 @@ static const char INDEX_HTML[] =
 "<input id=pn placeholder=Name><input id=ph placeholder='IP / host'>"
 "<input id=pk placeholder='API key (blank = keep when editing)'>"
 "<button onclick=savp()>Save</button> <button onclick=newp()>New</button></div>"
-"<div id=plist></div></div>"
+"<div id=plist></div>"
+"<div class=card><b>Backup & Restore</b>"
+"<p class=muted>Export your fleet config to a file, or import a saved config (replaces current fleet).</p>"
+"<button onclick=expc()>Export Config</button>"
+"<input type=file id=icf accept=.json style=margin-top:12px><button onclick=impc()>Import Config</button></div></div>"
 "<div class=tab id=t2><div class=card><b>Wi-Fi</b>"
 "<input id=ws placeholder=SSID><input id=wp type=password placeholder=Password>"
 "<button onclick=savew()>Save &amp; connect</button></div></div>"
@@ -111,6 +115,12 @@ static const char INDEX_HTML[] =
 "if(r.status>=400)alert(await r.text());else{newp();lp()}}"
 "async function delp(i){await fetch('/api/printers/remove',{method:'POST',body:JSON.stringify({i:i})});if(EI==i)newp();lp()}"
 "async function usep(i){await fetch('/api/printers/active',{method:'POST',body:JSON.stringify({i:i})});lp()}"
+"async function expc(){let r=await fetch('/api/config/export').then(x=>x.json());"
+"let b=new Blob([JSON.stringify(r,null,2)],{type:'application/json'});"
+"let a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='prusa-touch-config.json';a.click()}"
+"async function impc(){let f=icf.files[0];if(!f)return;if(!confirm('Replace ALL printers with config from '+f.name+'?'))return;"
+"let r=await fetch('/api/config/import',{method:'POST',body:f});"
+"if(r.status>=400)alert(await r.text());else{lp();alert('Import success!')}}"
 "async function savew(){await fetch('/api/wifi',{method:'POST',body:JSON.stringify({ssid:ws.value,pass:wp.value})});alert('Saved; connecting...')}"
 "async function ota(){let f=document.getElementById('fw').files[0];if(!f)return;"
 "document.getElementById('otalog').textContent='Uploading '+f.name+'...';"
@@ -479,6 +489,57 @@ static esp_err_t fleet_get(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t config_export_get(httpd_req_t *req)
+{
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < printer_store_count(); i++) {
+        pp_printer_t p;
+        if (!printer_store_get(i, &p)) continue;
+        cJSON *e = cJSON_CreateObject();
+        cJSON_AddStringToObject(e, "name", p.name);
+        cJSON_AddStringToObject(e, "host", p.host);
+        cJSON_AddNumberToObject(e, "port", p.port);
+        cJSON_AddStringToObject(e, "key", p.api_key);
+        cJSON_AddItemToArray(arr, e);
+    }
+    char *js = cJSON_PrintUnformatted(arr);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, js);
+    free(js); cJSON_Delete(arr);
+    return ESP_OK;
+}
+
+static esp_err_t config_import_post(httpd_req_t *req)
+{
+    char *body = recv_body(req);
+    if (!body) return ESP_FAIL;
+    cJSON *j = cJSON_Parse(body);
+    if (!cJSON_IsArray(j)) {
+        if (j) cJSON_Delete(j);
+        free(body);
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Expected JSON array");
+    }
+    printer_store_clear();
+    const cJSON *e = NULL;
+    cJSON_ArrayForEach(e, j) {
+        pp_printer_t p = {0};
+        const cJSON *n = cJSON_GetObjectItem(e, "name");
+        const cJSON *h = cJSON_GetObjectItem(e, "host");
+        const cJSON *po = cJSON_GetObjectItem(e, "port");
+        const cJSON *k = cJSON_GetObjectItem(e, "key");
+        if (cJSON_IsString(h)) strlcpy(p.host, h->valuestring, sizeof(p.host));
+        strlcpy(p.name, cJSON_IsString(n) && n->valuestring[0] ? n->valuestring : p.host, sizeof(p.name));
+        p.port = cJSON_IsNumber(po) ? (int)po->valuedouble : 80;
+        if (cJSON_IsString(k)) strlcpy(p.api_key, k->valuestring, sizeof(p.api_key));
+        if (p.host[0]) printer_store_add(&p);
+    }
+    app_state_printers_changed();
+    cJSON_Delete(j);
+    free(body);
+    httpd_resp_sendstr(req, "ok");
+    return ESP_OK;
+}
+
 /* Live screen mirror: stream the panel framebuffer as a 24-bit BMP (what's
  * literally on the display right now). RGB565 -> BGR888, bottom-up. */
 static esp_err_t screen_get(httpd_req_t *req)
@@ -576,6 +637,8 @@ void web_start(void)
         { .uri="/api/printers/update", .method=HTTP_POST, .handler=printers_update_post },
         { .uri="/api/printers/remove", .method=HTTP_POST, .handler=printers_remove_post },
         { .uri="/api/printers/active", .method=HTTP_POST, .handler=printers_active_post },
+        { .uri="/api/config/export", .method=HTTP_GET,  .handler=config_export_get },
+        { .uri="/api/config/import", .method=HTTP_POST, .handler=config_import_post },
         { .uri="/api/wifi",     .method=HTTP_POST, .handler=wifi_post },
         { .uri="/update",       .method=HTTP_POST, .handler=ota_post },
         { .uri="/api/update/check", .method=HTTP_GET,  .handler=update_check_get },
