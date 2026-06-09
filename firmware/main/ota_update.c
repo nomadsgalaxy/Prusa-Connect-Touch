@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "esp_http_client.h"
 #include "esp_https_ota.h"
+#include "esp_ota_ops.h"   /* ESP_ERR_OTA_VALIDATE_FAILED */
 #include "esp_crt_bundle.h"
 #include "esp_system.h"
 #include "cJSON.h"
@@ -124,29 +125,39 @@ bool ota_update_check(ota_check_t *out)
     return ok;
 }
 
-static int s_progress = -1;
+static int s_progress = -1;   /* -1 idle, -2 failed, 0..100 downloading/done */
+static char s_error[64];      /* why the last update failed ("" when none)   */
 
 int ota_update_get_progress(void) { return s_progress; }
+const char *ota_update_get_error(void) { return s_error; }
 
 void ota_update_apply(const char *bin_url)
 {
     if (!bin_url || !bin_url[0]) return;
     ESP_LOGI(TAG, "OTA from %s", bin_url);
     s_progress = 0;
+    s_error[0] = '\0';
 
     esp_http_client_config_t http = {
         .url = bin_url,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .timeout_ms = 30000,
         .keep_alive_enable = true,
+        /* GitHub 302-redirects release downloads to a ~900-char signed URL on
+         * release-assets.githubusercontent.com. The GET request line for that
+         * URL cannot be built in the default 512 B TX buffer, so without these
+         * esp_https_ota_begin() fails before the download starts. */
+        .buffer_size = 4096,
+        .buffer_size_tx = 2048,
     };
     esp_https_ota_config_t cfg = { .http_config = &http };
-    
+
     esp_https_ota_handle_t ota = NULL;
     esp_err_t e = esp_https_ota_begin(&cfg, &ota);
     if (e != ESP_OK) {
         ESP_LOGE(TAG, "OTA begin failed: %s", esp_err_to_name(e));
-        s_progress = -1;
+        snprintf(s_error, sizeof(s_error), "download failed: %s", esp_err_to_name(e));
+        s_progress = -2;
         return;
     }
 
@@ -162,7 +173,8 @@ void ota_update_apply(const char *bin_url)
     }
 
     if (e == ESP_OK) {
-        e = esp_https_ota_finish(ota);
+        e = esp_https_ota_finish(ota);   /* releases the handle, pass or fail */
+        ota = NULL;
         if (e == ESP_OK) {
             s_progress = 100;
             ESP_LOGI(TAG, "OTA ok — rebooting");
@@ -172,8 +184,10 @@ void ota_update_apply(const char *bin_url)
     }
 
     ESP_LOGE(TAG, "OTA failed: %s", esp_err_to_name(e));
-    s_progress = -1;
-    esp_https_ota_abort(ota);
+    snprintf(s_error, sizeof(s_error), "%s",
+             e == ESP_ERR_OTA_VALIDATE_FAILED ? "image validation failed" : esp_err_to_name(e));
+    s_progress = -2;
+    if (ota) esp_https_ota_abort(ota);
 }
 
 /* Background opt-in auto-updater. Does nothing unless the user has turned on

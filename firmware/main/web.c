@@ -97,7 +97,8 @@ static const char INDEX_HTML[] =
 "<button onclick=chk()>Check for updates</button>"
 "<button class=p id=ub style=display:none onclick=applyu()>Update now</button></div>"
 "<div class=card><b>Manual firmware upload</b>"
-"<p class=muted>Upload a Prusa-Touch .bin. The device reboots into it.</p>"
+"<p class=muted>Upload <b>prusa-touch-app.bin</b> (the ~1.7 MB update image) from the GitHub release "
+"&mdash; not the 16 MB full/USB image. The device reboots into it.</p>"
 "<input type=file id=fw accept=.bin><button class=p onclick=ota()>Flash</button>"
 "<div id=otalog class=muted></div></div></div>"
 "<div class=tab id=t4><div class=card><b>Live screen</b> "
@@ -192,9 +193,12 @@ static const char INDEX_HTML[] =
 "if(r.status>=400)alert(await r.text());else{lp();alert('Import success!')}}"
 "async function savew(){await fetch('/api/wifi',{method:'POST',body:JSON.stringify({ssid:ws.value,pass:wp.value})});alert('Saved; connecting...')}"
 "async function ota(){let f=document.getElementById('fw').files[0];if(!f)return;"
+/* The full/USB image is 16 MB and can never fit the 4.5 MB OTA slot - catch it client-side. */
+"if(f.size>5*1024*1024){document.getElementById('otalog').textContent=f.name+' is '+Math.round(f.size/1048576)+' MB - that is the full/USB image. Use prusa-touch-app.bin (~1.7 MB).';return}"
 "document.getElementById('otalog').textContent='Uploading '+f.name+'...';"
-"let r=await fetch('/update',{method:'POST',body:f});"
+"try{let r=await fetch('/update',{method:'POST',body:f});"
 "document.getElementById('otalog').textContent=await r.text()}"
+"catch(e){document.getElementById('otalog').textContent='Upload failed - connection lost. Verify the file is prusa-touch-app.bin and retry.'}}"
 "let GU='';"
 "async function chk(){document.getElementById('gh').textContent='Checking...';let n=0;"
 "const poll=async()=>{let r=await fetch('/api/update/check').then(x=>x.json());"
@@ -203,8 +207,14 @@ static const char INDEX_HTML[] =
 "GU=r.url;document.getElementById('ub').style.display=r.available?'inline-block':'none'};poll()}"
 "async function applyu(){if(!GU)return;document.getElementById('gh').innerHTML='Updating... <div class=bar id=upb><i style=width:0%></i></div>';"
 "await fetch('/api/update/apply',{method:'POST',body:JSON.stringify({url:GU})});"
-"const p=async()=>{let r=await fetch('/api/update/progress').then(x=>x.json());"
-"if(r.progress>=0){document.getElementById('upb').firstChild.style.width=r.progress+'%';setTimeout(p,1000)}};p()}"
+/* Poll until done or error. idle (-1) means the update task hasn't started yet, so keep
+   waiting (bounded) instead of freezing the bar; fetch errors during reboot are expected. */
+"let idle=0;const p=async()=>{let r;try{r=await fetch('/api/update/progress').then(x=>x.json())}catch(e){setTimeout(p,1000);return}"
+"if(r.state=='error'){document.getElementById('gh').textContent='Update failed: '+(r.msg||'unknown error');return}"
+"if(r.state=='done'){document.getElementById('upb').firstChild.style.width='100%';document.getElementById('gh').textContent='Update complete - rebooting...';return}"
+"if(r.progress>=0){idle=0;document.getElementById('upb').firstChild.style.width=r.progress+'%'}"
+"else if(++idle>10){document.getElementById('gh').textContent='Update did not start - check the device log.';return}"
+"setTimeout(p,1000)};setTimeout(p,800)}"
 "function lf_init(){let o=localStorage.getItem('farmorg');if(o){forg.value=o;lf()}}"
 "async function lf(){let o=forg.value.trim();if(!o){alert('Enter your Organization ID');return}localStorage.setItem('farmorg',o);fetch('/api/connect/setorg',{method:'POST',body:o});"
 "fstat.innerHTML='<div class=card style=padding:12px>Loading...</div>';forders.innerHTML='';"
@@ -405,19 +415,50 @@ static esp_err_t ota_post(httpd_req_t *req)
 {
     const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
     if (!part) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no partition"); return ESP_FAIL; }
-    if (req->content_len <= 0 || (size_t)req->content_len > part->size) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "oversized"); return ESP_FAIL; }
+    if (req->content_len <= 0 || (size_t)req->content_len > part->size) {
+        /* Almost certainly the 16 MB full/USB image. Refuse before reading the
+         * body and close the socket so the browser stops streaming instead of
+         * pushing the rest at a dead endpoint (the old apparent "hang"). */
+        httpd_resp_set_hdr(req, "Connection", "close");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+            "File too large for OTA - upload prusa-touch-app.bin (~1.7 MB), not the full/USB image");
+        return ESP_FAIL;
+    }
     esp_ota_handle_t ota = 0;
-    if (esp_ota_begin(part, req->content_len, &ota) != ESP_OK) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "begin fail"); return ESP_FAIL; }
+    esp_err_t err = esp_ota_begin(part, req->content_len, &ota);
+    if (err != ESP_OK) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err)); return ESP_FAIL; }
     char buf[1024];
     size_t remaining = (size_t)req->content_len;
+    int timeouts = 0;
     while (remaining > 0) {
         int r = httpd_req_recv(req, buf, remaining < sizeof(buf) ? remaining : sizeof(buf));
-        if (r <= 0) { esp_ota_abort(ota); return ESP_FAIL; }
-        esp_ota_write(ota, buf, r);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts <= 5) continue;   /* transient stall, retry bounded */
+        if (r <= 0) {
+            esp_ota_abort(ota);
+            httpd_resp_set_hdr(req, "Connection", "close");
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "upload interrupted");
+            return ESP_FAIL;
+        }
+        timeouts = 0;
+        err = esp_ota_write(ota, buf, r);
+        if (err != ESP_OK) {
+            esp_ota_abort(ota);
+            httpd_resp_set_hdr(req, "Connection", "close");
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
+            return ESP_FAIL;
+        }
         remaining -= r;
     }
-    esp_ota_end(ota);
-    esp_ota_set_boot_partition(part);
+    err = esp_ota_end(ota);   /* validates the received image */
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+            err == ESP_ERR_OTA_VALIDATE_FAILED
+                ? "Invalid image - upload prusa-touch-app.bin from the release, not full.bin"
+                : esp_err_to_name(err));
+        return ESP_FAIL;
+    }
+    err = esp_ota_set_boot_partition(part);
+    if (err != ESP_OK) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err)); return ESP_FAIL; }
     httpd_resp_sendstr(req, "OK - rebooting");
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
@@ -466,6 +507,9 @@ static esp_err_t update_progress_get(httpd_req_t *req)
     int p = ota_update_get_progress();
     cJSON *o = cJSON_CreateObject();
     cJSON_AddNumberToObject(o, "progress", p);
+    cJSON_AddStringToObject(o, "state", p == -2 ? "error" : p == -1 ? "idle"
+                                      : p >= 100 ? "done" : "running");
+    cJSON_AddStringToObject(o, "msg", ota_update_get_error());
     char *js = cJSON_PrintUnformatted(o);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, js);
