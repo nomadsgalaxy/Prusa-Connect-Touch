@@ -42,6 +42,37 @@ typedef struct {
     char           url[160];
 } pp_card_thumb_t;
 static EXT_RAM_BSS_ATTR pp_card_thumb_t s_card_thumbs[PP_MAX_PRINTERS];
+
+/* Live widget handles for each dashboard card (indexed by store index, same space
+ * as s_card_thumbs). Filled by make_printer_card; used by update_printer_card to
+ * refresh values in place instead of rebuilding the whole grid every publish. */
+typedef struct {
+    lv_obj_t *head;        /* state-tinted header strip            */
+    lv_obj_t *badge;       /* state badge container                */
+    lv_obj_t *badge_lbl;   /* state text                           */
+    lv_obj_t *name;        /* printer name                         */
+    lv_obj_t *fw;          /* "Firmware: x" (NULL if not shown)    */
+    lv_obj_t *nozzle, *bed, *speed, *z;   /* telemetry value labels */
+    lv_obj_t *bar;         /* progress bar (NULL when no job)      */
+    lv_obj_t *pct;         /* progress % label (NULL when no job)  */
+} dash_card_w_t;
+static dash_card_w_t s_dash_w[PP_MAX_PRINTERS];
+
+/* Layout signature of the rendered grid: which cards, in what order, with which
+ * structural features. If a fresh publish matches, only values changed and the
+ * cards are updated in place; any mismatch falls back to the full rebuild. */
+typedef struct {
+    int8_t  idx;                                    /* store index            */
+    uint8_t online, has_job, has_fw, has_thumb;     /* widgets present/absent */
+    char    model[28];                              /* drives the model image */
+} dash_card_sig_t;
+typedef struct {
+    bool valid;       /* a grid built with this signature is on screen */
+    bool banner;      /* conn_expired banner present                   */
+    int  shown;
+    dash_card_sig_t card[PP_MAX_PRINTERS];
+} dash_sig_t;
+static dash_sig_t s_dash_sig, s_dash_sig_new;
 static lv_obj_t      *s_scr_status;     /* per-printer detail      */
 static lv_obj_t *s_scr_control;    /* preheat/jog/home        */
 static lv_obj_t *s_scr_files;
@@ -1162,8 +1193,9 @@ static const lv_image_dsc_t *model_image(const char *model)
     return NULL;
 }
 
-/* One Connect-style telemetry cell: muted uppercase label over a bold white value. */
-static void card_cell(lv_obj_t *parent, int x, int y, const char *label, const char *value)
+/* One Connect-style telemetry cell: muted uppercase label over a bold white value.
+ * Returns the value label so the dashboard can refresh it in place. */
+static lv_obj_t *card_cell(lv_obj_t *parent, int x, int y, const char *label, const char *value)
 {
     lv_obj_t *l = lv_label_create(parent);
     lv_label_set_text(l, label);
@@ -1176,6 +1208,30 @@ static void card_cell(lv_obj_t *parent, int x, int y, const char *label, const c
     lv_obj_set_style_text_color(v, PP_TEXT, 0);
     lv_obj_set_style_text_font(v, &lv_font_montserrat_16, 0);
     lv_obj_align(v, LV_ALIGN_TOP_LEFT, x, y + 17);
+    return v;
+}
+
+/* Format the four telemetry cell values ("--" when offline). Shared by the card
+ * builder and the in-place updater so they can never disagree. */
+static void card_telemetry(const pp_status_t *s, char nz[24], char hb[24], char sp[16], char zx[16])
+{
+    if (s->online) {
+        if ((int)s->target_nozzle >= 1) snprintf(nz, 24, "%d/%d\xC2\xB0""C", (int)s->temp_nozzle, (int)s->target_nozzle);
+        else snprintf(nz, 24, "%d\xC2\xB0""C", (int)s->temp_nozzle);
+        if ((int)s->target_bed >= 1) snprintf(hb, 24, "%d/%d\xC2\xB0""C", (int)s->temp_bed, (int)s->target_bed);
+        else snprintf(hb, 24, "%d\xC2\xB0""C", (int)s->temp_bed);
+        snprintf(sp, 16, "%d%%", s->speed);
+        snprintf(zx, 16, "%.2fmm", s->axis_z);
+    } else {
+        strcpy(nz, "--"); strcpy(hb, "--"); strcpy(sp, "--"); strcpy(zx, "--");
+    }
+}
+
+/* Set a label only when the text actually changed, so unchanged cells don't
+ * invalidate (and force a redraw of) their screen area every poll. */
+static void dash_label_set(lv_obj_t *l, const char *txt)
+{
+    if (l && strcmp(lv_label_get_text(l), txt) != 0) lv_label_set_text(l, txt);
 }
 
 /* Prusa Connect dark-card anatomy: state-tinted header strip (name + badge),
@@ -1184,6 +1240,8 @@ static void make_printer_card(lv_obj_t *parent, const pp_status_t *s, int idx)
 {
     const bool online = s->online;
     const char *st = online ? (s->state[0] ? s->state : "READY") : "OFFLINE";
+    dash_card_w_t *w = &s_dash_w[idx];
+    memset(w, 0, sizeof(*w));
 
     lv_obj_t *c = lv_obj_create(parent);
     lv_obj_set_size(c, 380, 170);
@@ -1206,6 +1264,7 @@ static void make_printer_card(lv_obj_t *parent, const pp_status_t *s, int idx)
     lv_obj_set_style_pad_all(head, 0, 0);
     lv_obj_set_style_bg_color(head, online ? pp_state_strip(s->state) : PP_STRIP_GRAY, 0);
     lv_obj_clear_flag(head, LV_OBJ_FLAG_SCROLLABLE);
+    w->head = head;
 
     lv_obj_t *badge = lv_obj_create(head);
     lv_obj_set_size(badge, LV_SIZE_CONTENT, 34);
@@ -1221,6 +1280,8 @@ static void make_printer_card(lv_obj_t *parent, const pp_status_t *s, int idx)
     lv_obj_set_style_text_color(bl, PP_TEXT, 0);
     lv_obj_set_style_text_font(bl, &lv_font_montserrat_16, 0);
     lv_obj_center(bl);
+    w->badge = badge;
+    w->badge_lbl = bl;
 
     lv_obj_t *nm = lv_label_create(head);
     lv_label_set_text(nm, s->printer_name[0] ? s->printer_name : "Printer");
@@ -1229,6 +1290,7 @@ static void make_printer_card(lv_obj_t *parent, const pp_status_t *s, int idx)
     lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
     lv_obj_set_width(nm, 226);
     lv_obj_align(nm, LV_ALIGN_LEFT_MID, 12, 0);
+    w->name = nm;
 
     /* ---- identity row: thumbnail slot + model + firmware ---- */
     lv_obj_t *thumb = lv_obj_create(c);
@@ -1311,25 +1373,17 @@ static void make_printer_card(lv_obj_t *parent, const pp_status_t *s, int idx)
         lv_label_set_long_mode(fwl, LV_LABEL_LONG_DOT);
         lv_obj_set_width(fwl, 300);
         lv_obj_align(fwl, LV_ALIGN_TOP_LEFT, 66, 59);
+        w->fw = fwl;
     }
 
     /* ---- 3-column labeled telemetry grid ---- */
     char nz[24], hb[24], sp[16], zx[16];
-    if (online) {
-        if ((int)s->target_nozzle >= 1) snprintf(nz, sizeof(nz), "%d/%d\xC2\xB0""C", (int)s->temp_nozzle, (int)s->target_nozzle);
-        else snprintf(nz, sizeof(nz), "%d\xC2\xB0""C", (int)s->temp_nozzle);
-        if ((int)s->target_bed >= 1) snprintf(hb, sizeof(hb), "%d/%d\xC2\xB0""C", (int)s->temp_bed, (int)s->target_bed);
-        else snprintf(hb, sizeof(hb), "%d\xC2\xB0""C", (int)s->temp_bed);
-        snprintf(sp, sizeof(sp), "%d%%", s->speed);
-        snprintf(zx, sizeof(zx), "%.2fmm", s->axis_z);
-    } else {
-        strcpy(nz, "--"); strcpy(hb, "--"); strcpy(sp, "--"); strcpy(zx, "--");
-    }
+    card_telemetry(s, nz, hb, sp, zx);
     const int X1 = 14, X2 = 140, X3 = 266, R1 = 86, R2 = 124;
-    card_cell(c, X1, R1, "NOZZLE", nz);
-    card_cell(c, X2, R1, "SPEED",  sp);   /* Connect column order: NOZZLE / SPEED / BED */
-    card_cell(c, X3, R1, "BED",    hb);
-    card_cell(c, X1, R2, "Z AXIS", zx);
+    w->nozzle = card_cell(c, X1, R1, "NOZZLE", nz);
+    w->speed  = card_cell(c, X2, R1, "SPEED",  sp);   /* Connect column order: NOZZLE / SPEED / BED */
+    w->bed    = card_cell(c, X3, R1, "BED",    hb);
+    w->z      = card_cell(c, X1, R2, "Z AXIS", zx);
 
     /* progress (when printing) fills the 2nd/3rd column of row 2 */
     if (s->has_job) {
@@ -1353,6 +1407,43 @@ static void make_printer_card(lv_obj_t *parent, const pp_status_t *s, int idx)
         lv_obj_set_style_text_color(pv, PP_TEXT, 0);
         lv_obj_set_style_text_font(pv, &lv_font_montserrat_16, 0);
         lv_obj_align(pv, LV_ALIGN_TOP_LEFT, X3, R2 + 14);
+        w->bar = bar;
+        w->pct = pv;
+    }
+}
+
+/* Refresh one card's values in place (mirrors ui_apply_status). Only called when
+ * the layout signature matched, i.e. the card's widget set is exactly the one
+ * make_printer_card built for this store index. */
+static void update_printer_card(int idx, const pp_status_t *s)
+{
+    dash_card_w_t *w = &s_dash_w[idx];
+    if (!w->head) return;
+    const bool online = s->online;
+
+    lv_obj_set_style_bg_color(w->head, online ? pp_state_strip(s->state) : PP_STRIP_GRAY, 0);
+    lv_obj_set_style_bg_color(w->badge, online ? pp_state_badge(s->state) : PP_BADGE_GRAY, 0);
+    dash_label_set(w->badge_lbl, online ? (s->state[0] ? s->state : "READY") : "OFFLINE");
+    dash_label_set(w->name, s->printer_name[0] ? s->printer_name : "Printer");
+    if (w->fw) {
+        char fw[40];
+        snprintf(fw, sizeof(fw), "Firmware: %s", s->firmware);
+        dash_label_set(w->fw, fw);
+    }
+
+    char nz[24], hb[24], sp[16], zx[16];
+    card_telemetry(s, nz, hb, sp, zx);
+    dash_label_set(w->nozzle, nz);
+    dash_label_set(w->speed,  sp);
+    dash_label_set(w->bed,    hb);
+    dash_label_set(w->z,      zx);
+
+    if (s->has_job && w->bar) {
+        int pct = (int)(s->progress + 0.5f);
+        if (lv_bar_get_value(w->bar) != pct) lv_bar_set_value(w->bar, pct, LV_ANIM_OFF);
+        char pb[8];
+        snprintf(pb, sizeof(pb), "%d%%", pct);
+        dash_label_set(w->pct, pb);
     }
 }
 
@@ -1506,13 +1597,8 @@ static int dash_order_cmp(const void *pa, const void *pb)
 void ui_apply_dashboard(void *arg)
 {
     pp_dash_t *d = (pp_dash_t *)arg;
-    
-    /* Save current scroll position to prevent jumping to top on every refresh. */
-    int32_t scroll_y = lv_obj_get_scroll_y(s_dash_grid);
 
-    lv_obj_clean(s_dash_grid);
     s_dash_count = d->count;
-
     int n = d->count; if (n > PP_MAX_PRINTERS) n = PP_MAX_PRINTERS;
     if (!s_dash_items)   /* one-time PSRAM alloc — keeps ~30KB off the scarce internal heap (mbedTLS needs it) */
         s_dash_items = heap_caps_malloc(PP_MAX_PRINTERS * sizeof(pp_status_t), MALLOC_CAP_SPIRAM);
@@ -1521,6 +1607,48 @@ void ui_apply_dashboard(void *arg)
     for (int i = 0; i < n; i++) order[i] = i;
     s_dash_sort_items = d->items;
     if (n > 1) qsort(order, n, sizeof(int), dash_order_cmp);
+
+    bool hide_off = prefs_hide_offline();
+
+    /* Layout signature of this publish: which cards, in what order, with which
+     * structural features. While printing, publishes arrive ~every second but
+     * usually only values (temps/progress) change — detect that and skip the
+     * full grid teardown. */
+    memset(&s_dash_sig_new, 0, sizeof(s_dash_sig_new));
+    s_dash_sig_new.valid = true;
+    s_dash_sig_new.banner = d->conn_expired;
+    bool thumbs_current = true;
+    for (int k = 0; k < n; k++) {
+        int idx = order[k];
+        const pp_status_t *s = &d->items[idx];
+        if (hide_off && !s->online) continue;
+        dash_card_sig_t *cs = &s_dash_sig_new.card[s_dash_sig_new.shown++];
+        cs->idx       = (int8_t)idx;
+        cs->online    = s->online;
+        cs->has_job   = s->has_job;
+        cs->has_fw    = (s->firmware[0] != '\0');
+        cs->has_thumb = (s->has_job && s->job_thumb[0] && s_card_thumbs[idx].buf != NULL);
+        strlcpy(cs->model, s->model, sizeof(cs->model));
+        if (s->has_job && s->job_thumb[0] && strcmp(s->job_thumb, s_card_thumbs[idx].url) != 0)
+            thumbs_current = false;   /* new job image — the rebuild path starts its fetch */
+    }
+
+    if (thumbs_current && s_dash_sig_new.shown > 0 &&
+        memcmp(&s_dash_sig, &s_dash_sig_new, sizeof(dash_sig_t)) == 0) {
+        /* Same cards, same order, same structure: refresh values in place. */
+        for (int k = 0; k < s_dash_sig_new.shown; k++) {
+            int idx = s_dash_sig_new.card[k].idx;
+            update_printer_card(idx, &d->items[idx]);
+        }
+        free(d);
+        return;
+    }
+    s_dash_sig = s_dash_sig_new;
+
+    /* Structure changed — full rebuild. Save the scroll position so the grid
+     * doesn't jump to the top. */
+    int32_t scroll_y = lv_obj_get_scroll_y(s_dash_grid);
+    lv_obj_clean(s_dash_grid);
 
     /* Connect sign-in lapsed: prepend a full-width re-connect banner (flex ROW_WRAP gives it
      * its own row above the cards). No credential entry on-device — the user re-authenticates
@@ -1549,7 +1677,6 @@ void ui_apply_dashboard(void *arg)
                 "Reconnect from the web Account tab. Local printers stay reachable.");
     }
 
-    bool hide_off = prefs_hide_offline();
     int shown = 0;
     for (int k = 0; k < n; k++) {
         int idx = order[k];                              /* original store index */
