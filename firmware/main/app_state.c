@@ -20,6 +20,7 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_system.h"   /* esp_restart (orientation-class relayout) */
+#include "esp_timer.h"    /* esp_timer_get_time — dashboard publish coalescing */
 #include "sdkconfig.h"
 
 #include "pandatouch_display.h"   /* pt_display_schedule_ui */
@@ -707,6 +708,25 @@ static void run_command(const pp_cmd_t *cmd)
     poll_active_and_publish();
 }
 
+/* Run every queued UI command now, without blocking. Called at several points across the poll
+ * cycle so a button press (home/jog/preheat/pause) is serviced promptly instead of waiting for
+ * the whole cloud poll sequence to finish. Runs on the net task, same as the polling, so no new
+ * locking is required. */
+static void drain_commands(void)
+{
+    pp_cmd_t cmd;
+    while (s_cmds && xQueueReceive(s_cmds, &cmd, 0) == pdTRUE) {
+        ESP_LOGI(TAG, "command %d", cmd.kind);
+        run_command(&cmd);
+    }
+}
+
+/* Coalesce the fleet-overview redraw: on a local-poll change, republish at most this often.
+ * Fleet temps don't need 1 s granularity, and rebuilding/refreshing every card competes with
+ * touch/scroll on the LVGL thread. Cloud refreshes (did_cloud) always publish. */
+#define DASH_PUBLISH_MIN_MS 2500
+static int64_t s_last_dash_pub_us;
+
 static void net_task(void *arg)
 {
     (void)arg;
@@ -717,6 +737,7 @@ static void net_task(void *arg)
     publish_dashboard();
     publish_status();
     for (;;) {
+        drain_commands();   /* service pending button presses before the (slow) poll cycle */
         int n = printer_store_count();
         if (n > 0) {
             /* If we have cloud printers, poll Connect once per cycle. */
@@ -789,6 +810,7 @@ static void net_task(void *arg)
                 }
                 if (fleet) heap_caps_free(fleet);
             }
+            drain_commands();   /* the fleet GET is the longest blocker — service commands now */
 
             /* The bulk fleet list omits network_info/prusalink_api_key, so learn each cloud
              * printer's LAN IP + PrusaLink key from the per-printer endpoint (one printer per
@@ -837,11 +859,24 @@ static void net_task(void *arg)
                 }
             }
 
+            drain_commands();   /* one more checkpoint before the per-printer poll */
             int i = s_poll_idx % n;
             s_poll_idx++;
             bool changed = poll_printer(i);
             if (i == printer_store_active() || did_cloud) publish_status();   /* did_cloud refreshes the active cloud printer's detail/control view */
-            if (changed || did_cloud) publish_dashboard();   /* rebuild cards if cloud updated */
+            /* Always republish on a cloud refresh; coalesce local-poll changes so the fleet
+             * overview redraws at most every DASH_PUBLISH_MIN_MS, keeping the LVGL thread free
+             * for smooth scroll/tap (the detail screen keeps its full-rate updates). */
+            if (did_cloud) {
+                publish_dashboard();
+                s_last_dash_pub_us = esp_timer_get_time();
+            } else if (changed) {
+                int64_t now = esp_timer_get_time();
+                if (now - s_last_dash_pub_us >= (int64_t)DASH_PUBLISH_MIN_MS * 1000) {
+                    publish_dashboard();
+                    s_last_dash_pub_us = now;
+                }
+            }
         } else {
             /* No printers configured yet. */
             xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -883,6 +918,9 @@ void app_state_start(void)
     }
     s_poll_idx = 0;
     /* 16 KB: cloud TLS (do_http frame ~3.3 KB) + token-refresh + cJSON parsing of
-     * the fleet/stats/orders responses overflowed the old 8 KB stack (crash loop). */
-    xTaskCreate(net_task, "pp_net", 16384, NULL, 5, NULL);
+     * the fleet/stats/orders responses overflowed the old 8 KB stack (crash loop).
+     * Pinned to core 0 (PRO_CPU, alongside WiFi) so the CPU-heavy cloud TLS/crypto in the poll
+     * and command path never contends with the LVGL render task (pinned to core 1) — this keeps
+     * dashboard scroll/tap smooth during the ~6 s cloud polls. */
+    xTaskCreatePinnedToCore(net_task, "pp_net", 16384, NULL, 5, NULL, 0);
 }

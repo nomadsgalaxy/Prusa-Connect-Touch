@@ -178,7 +178,12 @@ typedef struct {
     char location[512];   /* OAuth redirect URLs (/login/?next=<authorize>) run ~270 chars */
 } http_resp_t;
 
-static http_resp_t do_http(const char *method, const char *url, const char *ct, const char *body, bool with_auth)
+/* Control commands (home/jog/preheat/pause/...) use a shorter timeout than bulk polls so a
+ * stalled cloud request can't hold the TLS mutex — and therefore the next command — for the
+ * full 15 s. Polls keep the longer timeout (the cloud is occasionally slow under load). */
+#define CONNECT_CMD_TIMEOUT_MS 8000
+
+static http_resp_t do_http_to(const char *method, const char *url, const char *ct, const char *body, bool with_auth, int timeout_ms)
 {
     ESP_LOGI(TAG, "HTTP %s %s", method, url);
     http_resp_t r = {0};
@@ -189,7 +194,7 @@ static http_resp_t do_http(const char *method, const char *url, const char *ct, 
         .method = (!strcmp(method, "POST")) ? HTTP_METHOD_POST : HTTP_METHOD_GET,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .user_agent = PRUSA_USER_AGENT,
-        .timeout_ms = 15000,
+        .timeout_ms = timeout_ms,
         .event_handler = http_event,
         .user_data = &acc,
         .buffer_size_tx = 4096,
@@ -222,6 +227,11 @@ static http_resp_t do_http(const char *method, const char *url, const char *ct, 
     esp_http_client_cleanup(client);
     if (s_http_mtx) xSemaphoreGive(s_http_mtx);
     return r;
+}
+
+static http_resp_t do_http(const char *method, const char *url, const char *ct, const char *body, bool with_auth)
+{
+    return do_http_to(method, url, ct, body, with_auth, 15000);
 }
 
 /* Ported followRedirects */
@@ -640,7 +650,7 @@ static esp_err_t connect_sync_cmd(const char *uuid, const char *cmd, const char 
     char url[256]; snprintf(url, sizeof(url), "https://connect.prusa3d.com/app/printers/%s/commands/sync", uuid);
     char body[512];
     snprintf(body, sizeof(body), "{\"command\":\"%s\",\"args\":%s}", cmd, args_json ? args_json : "[]");
-    http_resp_t r = do_http("POST", url, "application/json", body, true);
+    http_resp_t r = do_http_to("POST", url, "application/json", body, true, CONNECT_CMD_TIMEOUT_MS);
     free(r.body);
     return (r.code >= 200 && r.code < 300) ? ESP_OK : ESP_FAIL;
 }
@@ -687,10 +697,10 @@ static esp_err_t connect_send_kwargs(const char *uuid, const char *cmd, const ch
     char url[256]; snprintf(url, sizeof(url), "https://connect.prusa3d.com/app/printers/%s/commands/sync", uuid);
     char body[512];
     snprintf(body, sizeof(body), "{\"command\":\"%s\",\"kwargs\":%s}", cmd, (kwargs_json && kwargs_json[0]) ? kwargs_json : "{}");
-    http_resp_t r = do_http("POST", url, "application/json", body, true);
+    http_resp_t r = do_http_to("POST", url, "application/json", body, true, CONNECT_CMD_TIMEOUT_MS);
     if (r.code == 401 && prusa_connect_refresh_token() == ESP_OK) {   /* token expired mid-session */
         free(r.body);
-        r = do_http("POST", url, "application/json", body, true);
+        r = do_http_to("POST", url, "application/json", body, true, CONNECT_CMD_TIMEOUT_MS);
     }
     esp_err_t rc = (r.code >= 200 && r.code < 300) ? ESP_OK : ESP_FAIL;
     ESP_LOGI(TAG, "cmd %s -> %d", cmd, r.code);
