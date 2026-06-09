@@ -98,7 +98,7 @@ static const char INDEX_HTML[] =
 "<button class=p id=ub style=display:none onclick=applyu()>Update now</button></div>"
 "<div class=card><b>Manual firmware upload</b>"
 "<p class=muted>Upload <b>prusa-touch-app.bin</b> (the ~1.7 MB update image) from the GitHub release "
-"&mdash; not the 16 MB full/USB image. The device reboots into it.</p>"
+"&mdash; not the ~16 MB full/USB image. The device reboots after updating.</p>"
 "<input type=file id=fw accept=.bin><button class=p onclick=ota()>Flash</button>"
 "<div id=otalog class=muted></div></div></div>"
 "<div class=tab id=t4><div class=card><b>Live screen</b> "
@@ -237,6 +237,9 @@ static const char INDEX_HTML[] =
 static esp_err_t root_get(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
+    /* The page ships inside the firmware image; a cached copy survives firmware
+     * updates and keeps running stale JS against new endpoints. Never cache. */
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
 }
 
