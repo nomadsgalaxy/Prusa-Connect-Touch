@@ -46,9 +46,8 @@ CONFIG_LV_FONT_MONTSERRAT_20=y
 CONFIG_LV_FONT_MONTSERRAT_28=y
 CONFIG_LV_FONT_MONTSERRAT_40=y
 
-# PERF TEST BUILD: live FPS + CPU% overlay (bottom-right) so scroll cost is measurable on-device.
-# (Set back to =n for a shipping build.)
-CONFIG_LV_USE_PERF_MONITOR=y
+# No on-screen FPS/perf overlay in the shipped UI (set =y to measure render performance)
+CONFIG_LV_USE_PERF_MONITOR=n
 
 # Tighter LVGL refresh + input sampling than the ~30 ms default, for better touch-follow while
 # scrolling. Safe: caps higher but render-bound screens simply stay CPU-limited.
