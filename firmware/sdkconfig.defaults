@@ -46,8 +46,14 @@ CONFIG_LV_FONT_MONTSERRAT_20=y
 CONFIG_LV_FONT_MONTSERRAT_28=y
 CONFIG_LV_FONT_MONTSERRAT_40=y
 
-# No on-screen FPS/perf overlay in the shipped UI
-CONFIG_LV_USE_PERF_MONITOR=n
+# PERF TEST BUILD: live FPS + CPU% overlay (bottom-right) so scroll cost is measurable on-device.
+# (Set back to =n for a shipping build.)
+CONFIG_LV_USE_PERF_MONITOR=y
+
+# Tighter LVGL refresh + input sampling than the ~30 ms default, for better touch-follow while
+# scrolling. Safe: caps higher but render-bound screens simply stay CPU-limited.
+CONFIG_LV_DEF_REFR_PERIOD=16
+CONFIG_LV_INDEV_DEF_READ_PERIOD=16
 
 # QR code widget — About/License screen links to the GitHub repo
 CONFIG_LV_USE_QRCODE=y
