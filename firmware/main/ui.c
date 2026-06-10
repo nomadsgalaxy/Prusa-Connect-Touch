@@ -1294,7 +1294,6 @@ static void fmt_telemetry(const pp_status_t *s, char *nz, char *hb, char *sp, ch
 /* Per-card widget handles captured at build time so a poll that changes only values can update
  * them in place (gist #11) instead of destroying + rebuilding every card (flicker + CPU). */
 typedef struct {
-    lv_obj_t *card, *thumb;      /* scroll-LOD targets (clip_corner / thumbnail) */
     lv_obj_t *strip, *badge, *badge_lbl, *name_lbl, *model_lbl;
     lv_obj_t *v_noz, *v_speed, *v_bed, *v_z, *prog_bar, *prog_lbl;
 } dash_refs_t;
@@ -1303,35 +1302,46 @@ static int      s_dref_n;        /* number of cards currently laid out */
 static uint32_t s_dash_sig;      /* structural signature of the current layout */
 static bool     s_dash_have;     /* a valid prior layout exists */
 
-/* Scroll-aware dashboard: the grid scrolls at ~10 FPS (render-bound), so (a) a publish landing
- * mid-gesture must not invalidate cards and steal frames — park it and apply when the scroll
- * (including the momentum glide) settles; (b) while in motion the cards shed their most
- * expensive pixels — the job thumbnail image and the rounded-corner clip mask — and restore
- * them at rest, so the resting look is unchanged. */
-static bool       s_dash_scrolling;
-static pp_dash_t *s_dash_pending;    /* newest publish deferred during a scroll (we own/free it) */
+/* ---- Snapshot-cached cards ----
+ * Scrolling the fleet was render-bound (~10 FPS): every frame software-rendered each card's
+ * rounded-corner masks, ~10 labels of text, and (PNG-decoded!) thumbnail. Instead, each card's
+ * live widget tree now lives on a hidden host screen and is rendered ONCE per data change into
+ * a PSRAM bitmap; the visible grid holds plain lv_image widgets showing those bitmaps, so a
+ * scroll frame is just a few opaque blits. Cards are pixel-identical (corners bake against the
+ * grid background). If a bitmap can't be allocated, that slot falls back to a live card in the
+ * grid, exactly the old behavior. */
+#define DASH_CARD_W 380
+#define DASH_CARD_H 170
+static lv_obj_t      *s_card_host;                    /* hidden screen hosting the live cards  */
+static lv_obj_t      *s_card_wrap[PP_MAX_PRINTERS];   /* per-slot wrapper on the host          */
+static lv_obj_t      *s_card_img [PP_MAX_PRINTERS];   /* per-slot image widget in the grid     */
+static lv_draw_buf_t *s_card_snap[PP_MAX_PRINTERS];   /* per-slot RGB565 bitmap (PSRAM, reused) */
 
-static void dash_scroll_lod(bool scrolling)
+/* Re-render slot's live card into its bitmap and refresh the grid image showing it. */
+static void dash_snapshot_slot(int slot)
 {
-    for (int i = 0; i < s_dref_n; i++) {
-        if (s_dref[i].thumb) {
-            if (scrolling) lv_obj_add_flag(s_dref[i].thumb, LV_OBJ_FLAG_HIDDEN);
-            else           lv_obj_remove_flag(s_dref[i].thumb, LV_OBJ_FLAG_HIDDEN);
-        }
-        if (s_dref[i].card)
-            lv_obj_set_style_clip_corner(s_dref[i].card, !scrolling, 0);
+    if (slot < 0 || slot >= PP_MAX_PRINTERS) return;
+    if (!s_card_wrap[slot] || !s_card_snap[slot] || !s_card_img[slot]) return;   /* live-card fallback slot */
+    lv_obj_update_layout(s_card_wrap[slot]);
+    if (lv_snapshot_take_to_draw_buf(s_card_wrap[slot], LV_COLOR_FORMAT_RGB565, s_card_snap[slot]) == LV_RESULT_OK) {
+        lv_image_cache_drop(s_card_snap[slot]);       /* content changed under the same pointer */
+        lv_image_set_src(s_card_img[slot], s_card_snap[slot]);
+        lv_obj_invalidate(s_card_img[slot]);
     }
 }
+
+/* A publish landing mid-gesture would re-snapshot cards and invalidate images, stealing frames
+ * from the scroll — park it and apply the newest one when the scroll (incl. momentum) settles. */
+static bool       s_dash_scrolling;
+static pp_dash_t *s_dash_pending;    /* newest publish deferred during a scroll (we own/free it) */
 
 static void on_dash_scroll(lv_event_t *e)
 {
     lv_event_code_t code = lv_event_get_code(e);
-    if (code == LV_EVENT_SCROLL_BEGIN && !s_dash_scrolling) {
+    if (code == LV_EVENT_SCROLL_BEGIN) {
         s_dash_scrolling = true;
-        dash_scroll_lod(true);
     } else if (code == LV_EVENT_SCROLL_END && s_dash_scrolling) {
         s_dash_scrolling = false;
-        dash_scroll_lod(false);
         if (s_dash_pending) {           /* apply the publish that arrived mid-scroll */
             pp_dash_t *d = s_dash_pending;
             s_dash_pending = NULL;
@@ -1340,26 +1350,49 @@ static void on_dash_scroll(lv_event_t *e)
     }
 }
 
-static void update_dash_card(const dash_refs_t *r, const pp_status_t *s)
+/* Set a label only if the text actually differs; reports whether anything changed so the
+ * caller can skip the (whole-card) re-snapshot when a publish was a visual no-op. */
+static bool lbl_set_if_changed(lv_obj_t *lbl, const char *txt)
 {
+    if (!lbl || strcmp(lv_label_get_text(lbl), txt) == 0) return false;
+    lv_label_set_text(lbl, txt);
+    return true;
+}
+
+static bool update_dash_card(const dash_refs_t *r, const pp_status_t *s)
+{
+    bool ch = false;
     bool online = s->online;
     const char *st = online ? (s->state[0] ? s->state : "READY") : "OFFLINE";
-    if (r->strip)     lv_obj_set_style_bg_color(r->strip, online ? pp_state_strip(s->state) : PP_STRIP_GRAY, 0);
-    if (r->badge)     lv_obj_set_style_bg_color(r->badge, online ? pp_state_badge(s->state) : PP_BADGE_GRAY, 0);
-    if (r->badge_lbl) lv_label_set_text(r->badge_lbl, st);
-    if (r->name_lbl)  lv_label_set_text(r->name_lbl, s->printer_name[0] ? s->printer_name : "Printer");
-    if (r->model_lbl) lv_label_set_text(r->model_lbl, s->model[0] ? s->model : (online ? "Prusa printer" : ""));
+    /* The state text uniquely determines the strip/badge tints ("OFFLINE" covers the online
+     * flag), so colors only need refreshing when the badge text changes. */
+    if (r->badge_lbl && strcmp(lv_label_get_text(r->badge_lbl), st) != 0) {
+        lv_label_set_text(r->badge_lbl, st);
+        if (r->strip) lv_obj_set_style_bg_color(r->strip, online ? pp_state_strip(s->state) : PP_STRIP_GRAY, 0);
+        if (r->badge) lv_obj_set_style_bg_color(r->badge, online ? pp_state_badge(s->state) : PP_BADGE_GRAY, 0);
+        ch = true;
+    }
+    ch |= lbl_set_if_changed(r->name_lbl, s->printer_name[0] ? s->printer_name : "Printer");
+    ch |= lbl_set_if_changed(r->model_lbl, s->model[0] ? s->model : (online ? "Prusa printer" : ""));
     char nz[24], hb[24], sp[16], zx[16];
     fmt_telemetry(s, nz, hb, sp, zx);
-    if (r->v_noz)   lv_label_set_text(r->v_noz, nz);
-    if (r->v_speed) lv_label_set_text(r->v_speed, sp);
-    if (r->v_bed)   lv_label_set_text(r->v_bed, hb);
-    if (r->v_z)     lv_label_set_text(r->v_z, zx);
+    ch |= lbl_set_if_changed(r->v_noz, nz);
+    ch |= lbl_set_if_changed(r->v_speed, sp);
+    ch |= lbl_set_if_changed(r->v_bed, hb);
+    ch |= lbl_set_if_changed(r->v_z, zx);
     if (s->has_job && r->prog_bar) {
         int pct = (int)(s->progress + 0.5f);
-        lv_bar_set_value(r->prog_bar, pct, LV_ANIM_OFF);
-        if (r->prog_lbl) lv_label_set_text_fmt(r->prog_lbl, "%d%%", pct);
+        if (lv_bar_get_value(r->prog_bar) != pct) {
+            lv_bar_set_value(r->prog_bar, pct, LV_ANIM_OFF);
+            ch = true;
+        }
+        if (r->prog_lbl) {
+            char pb[8];
+            snprintf(pb, sizeof(pb), "%d%%", pct);
+            ch |= lbl_set_if_changed(r->prog_lbl, pb);
+        }
     }
+    return ch;
 }
 
 /* Structural fingerprint: which printers, in what order, online/job/firmware/thumbnail state.
@@ -1403,7 +1436,6 @@ static void make_printer_card(lv_obj_t *parent, const pp_status_t *s, int idx, d
     lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(c, on_card_clicked, LV_EVENT_CLICKED, (void *)(intptr_t)idx);
     if (!online) lv_obj_set_style_opa(c, LV_OPA_70, 0);   /* dim offline cards */
-    if (r) r->card = c;
 
     /* ---- header strip: name (white) + flush state badge (muted tint, white text) ---- */
     lv_obj_t *head = lv_obj_create(c);
@@ -1451,7 +1483,6 @@ static void make_printer_card(lv_obj_t *parent, const pp_status_t *s, int idx, d
     lv_obj_set_style_radius(thumb, 4, 0);
     lv_obj_set_style_pad_all(thumb, 0, 0);
     lv_obj_clear_flag(thumb, LV_OBJ_FLAG_SCROLLABLE);
-    if (r) r->thumb = thumb;
 
     const lv_image_dsc_t *img = model_image(s->model);
     bool has_job_thumb = (s->has_job && s->job_thumb[0]);
@@ -1561,6 +1592,36 @@ static void make_printer_card(lv_obj_t *parent, const pp_status_t *s, int idx, d
         lv_obj_align(pv, LV_ALIGN_TOP_LEFT, X3, R2 + 14);
         if (r) { r->prog_bar = bar; r->prog_lbl = pv; }
     }
+}
+
+/* Build one dashboard slot: the live card on the hidden host plus a snapshot image in the
+ * grid. Falls back to the old behavior (live card directly in the grid) if the bitmap can't
+ * be allocated. The wrapper's plain PP_BG background is what the card's rounded corners bake
+ * against, matching the grid background exactly. */
+static void dash_build_slot(int slot, const pp_status_t *s, int idx)
+{
+    if (!s_card_snap[slot])
+        s_card_snap[slot] = lv_draw_buf_create(DASH_CARD_W, DASH_CARD_H, LV_COLOR_FORMAT_RGB565, LV_STRIDE_AUTO);
+    if (!s_card_host || !s_card_snap[slot]) {
+        make_printer_card(s_dash_grid, s, idx, &s_dref[slot]);   /* fallback: live card */
+        return;
+    }
+    lv_obj_t *wrap = lv_obj_create(s_card_host);
+    lv_obj_set_size(wrap, DASH_CARD_W, DASH_CARD_H);
+    lv_obj_set_style_bg_color(wrap, PP_BG, 0);
+    lv_obj_set_style_radius(wrap, 0, 0);
+    lv_obj_set_style_border_width(wrap, 0, 0);
+    lv_obj_set_style_pad_all(wrap, 0, 0);
+    lv_obj_clear_flag(wrap, LV_OBJ_FLAG_SCROLLABLE);
+    make_printer_card(wrap, s, idx, &s_dref[slot]);
+    s_card_wrap[slot] = wrap;
+
+    lv_obj_t *img = lv_image_create(s_dash_grid);
+    lv_obj_set_size(img, DASH_CARD_W, DASH_CARD_H);
+    lv_obj_add_flag(img, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(img, on_card_clicked, LV_EVENT_CLICKED, (void *)(intptr_t)idx);
+    s_card_img[slot] = img;
+    dash_snapshot_slot(slot);
 }
 
 /* Wordmark: white-outlined box with [ PRUSA | TOUCH ] over a small "by NomadsGalaxy"
@@ -1797,9 +1858,14 @@ static void build_dashboard_screen(void)
     lv_obj_set_flex_flow(s_dash_grid, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(s_dash_grid, LV_FLEX_ALIGN_SPACE_EVENLY,
                           LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    /* Scroll-aware updates + LOD (defer publishes, shed thumbs/clip masks while moving). */
+    /* Defer publishes while the grid is scrolling (applied on scroll-end). */
     lv_obj_add_event_cb(s_dash_grid, on_dash_scroll, LV_EVENT_SCROLL_BEGIN, NULL);
     lv_obj_add_event_cb(s_dash_grid, on_dash_scroll, LV_EVENT_SCROLL_END, NULL);
+
+    /* Hidden screen (never loaded) hosting the live card widget trees the grid's bitmap
+     * cards are snapshotted from. */
+    s_card_host = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(s_card_host, PP_BG, 0);
 }
 
 /* Lower rank sorts earlier when grouping by status. */
@@ -1846,7 +1912,10 @@ static int dash_order_cmp(const void *pa, const void *pb)
 void ui_apply_dashboard(void *arg)
 {
     pp_dash_t *d = (pp_dash_t *)arg;
-    if (s_dash_scrolling) {       /* mid-gesture: park the newest publish, apply on scroll end */
+    /* Mid-gesture: park the newest publish, applied from the scroll-end handler. The
+     * lv_obj_is_scrolling() check keeps a lost SCROLL_END (e.g. a screen switch mid-throw)
+     * from parking publishes forever. */
+    if (s_dash_scrolling && s_dash_grid && lv_obj_is_scrolling(s_dash_grid)) {
         free(s_dash_pending);
         s_dash_pending = d;
         return;
@@ -1872,16 +1941,22 @@ void ui_apply_dashboard(void *arg)
         for (int k = 0; k < n && slot < s_dref_n; k++) {
             int idx = order[k];
             if (hide_off && !d->items[idx].online) continue;
-            update_dash_card(&s_dref[slot], &d->items[idx]);
+            if (update_dash_card(&s_dref[slot], &d->items[idx]))
+                dash_snapshot_slot(slot);   /* re-render the bitmap only when something visible changed */
             slot++;
         }
         free(d);
         return;
     }
 
-    /* Slow path: the structure changed (count/order/online/job/firmware/thumbnail) -> rebuild. */
+    /* Slow path: the structure changed (count/order/online/job/firmware/thumbnail) -> rebuild.
+     * Bitmap buffers (s_card_snap) are slot-sized and survive rebuilds; only the widget trees
+     * (grid images + host cards) are recreated. */
     int32_t scroll_y = lv_obj_get_scroll_y(s_dash_grid);   /* keep scroll position across rebuild */
     lv_obj_clean(s_dash_grid);
+    if (s_card_host) lv_obj_clean(s_card_host);
+    memset(s_card_wrap, 0, sizeof(s_card_wrap));
+    memset(s_card_img,  0, sizeof(s_card_img));
     s_dref_n = 0;
 
     /* Connect sign-in lapsed: prepend a full-width re-connect banner (flex ROW_WRAP gives it
@@ -1915,7 +1990,8 @@ void ui_apply_dashboard(void *arg)
     for (int k = 0; k < n; k++) {
         int idx = order[k];                              /* original store index */
         if (hide_off && !d->items[idx].online) continue;
-        make_printer_card(s_dash_grid, &d->items[idx], idx, shown < PP_MAX_PRINTERS ? &s_dref[shown] : NULL);
+        if (shown < PP_MAX_PRINTERS) dash_build_slot(shown, &d->items[idx], idx);
+        else make_printer_card(s_dash_grid, &d->items[idx], idx, NULL);
         shown++;
     }
     if (shown == 0) {

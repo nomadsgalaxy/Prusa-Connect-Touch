@@ -62,6 +62,11 @@ CONFIG_LV_INDEV_DEF_READ_PERIOD=16
 CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
 CONFIG_ESP32S3_DATA_CACHE_64KB=y
 
+# Snapshot-cached dashboard cards: each card renders to a PSRAM bitmap once on data change and
+# the fleet grid scrolls those bitmaps (plain blits) instead of re-rendering every widget per
+# frame. lv_snapshot is off by default in LVGL.
+CONFIG_LV_USE_SNAPSHOT=y
+
 # QR code widget — About/License screen links to the GitHub repo
 CONFIG_LV_USE_QRCODE=y
 
