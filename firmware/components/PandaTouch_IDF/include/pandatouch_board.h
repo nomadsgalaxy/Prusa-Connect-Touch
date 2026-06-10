@@ -3,7 +3,12 @@
 
 /* ===== Panel Timings (from your original pinout) ===== */
 #define PT_LCD_PCLK_HZ_MIN 14000000
-#define PT_LCD_PCLK_HZ 23000000
+/* PERF EXPERIMENT: 17 MHz (~40 Hz refresh, was 23 MHz / ~54 Hz). The frame buffer lives in
+ * PSRAM, so scan-out competes with LVGL rendering for the same PSRAM bus; a lower pixel clock
+ * cuts that always-on read traffic (and the bounce-buffer copy CPU tax) by ~25%. 40 Hz is still
+ * well above what the render loop can produce (~10 FPS). Revert to 23000000 if the panel
+ * flickers/shimmers. */
+#define PT_LCD_PCLK_HZ 17000000
 
 #define PT_LCD_H_RES 800
 #define PT_LCD_HSYNC_PULSE_WIDTH 4

@@ -55,6 +55,13 @@ CONFIG_LV_USE_PERF_MONITOR=y
 CONFIG_LV_DEF_REFR_PERIOD=16
 CONFIG_LV_INDEV_DEF_READ_PERIOD=16
 
+# PERF EXPERIMENT: bigger CPU caches. This build executes code AND keeps rodata (font glyphs)
+# in PSRAM, so the default 16 KB icache / 32 KB dcache miss constantly while rendering text.
+# Doubling both costs 48 KB of internal SRAM (watch /api/info heap_internal_min) but raises the
+# PSRAM hit rate on the exact data the renderer touches every frame.
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+
 # QR code widget — About/License screen links to the GitHub repo
 CONFIG_LV_USE_QRCODE=y
 

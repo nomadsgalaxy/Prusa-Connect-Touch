@@ -1294,6 +1294,7 @@ static void fmt_telemetry(const pp_status_t *s, char *nz, char *hb, char *sp, ch
 /* Per-card widget handles captured at build time so a poll that changes only values can update
  * them in place (gist #11) instead of destroying + rebuilding every card (flicker + CPU). */
 typedef struct {
+    lv_obj_t *card, *thumb;      /* scroll-LOD targets (clip_corner / thumbnail) */
     lv_obj_t *strip, *badge, *badge_lbl, *name_lbl, *model_lbl;
     lv_obj_t *v_noz, *v_speed, *v_bed, *v_z, *prog_bar, *prog_lbl;
 } dash_refs_t;
@@ -1301,6 +1302,43 @@ static dash_refs_t s_dref[PP_MAX_PRINTERS];
 static int      s_dref_n;        /* number of cards currently laid out */
 static uint32_t s_dash_sig;      /* structural signature of the current layout */
 static bool     s_dash_have;     /* a valid prior layout exists */
+
+/* Scroll-aware dashboard: the grid scrolls at ~10 FPS (render-bound), so (a) a publish landing
+ * mid-gesture must not invalidate cards and steal frames — park it and apply when the scroll
+ * (including the momentum glide) settles; (b) while in motion the cards shed their most
+ * expensive pixels — the job thumbnail image and the rounded-corner clip mask — and restore
+ * them at rest, so the resting look is unchanged. */
+static bool       s_dash_scrolling;
+static pp_dash_t *s_dash_pending;    /* newest publish deferred during a scroll (we own/free it) */
+
+static void dash_scroll_lod(bool scrolling)
+{
+    for (int i = 0; i < s_dref_n; i++) {
+        if (s_dref[i].thumb) {
+            if (scrolling) lv_obj_add_flag(s_dref[i].thumb, LV_OBJ_FLAG_HIDDEN);
+            else           lv_obj_remove_flag(s_dref[i].thumb, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (s_dref[i].card)
+            lv_obj_set_style_clip_corner(s_dref[i].card, !scrolling, 0);
+    }
+}
+
+static void on_dash_scroll(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_SCROLL_BEGIN && !s_dash_scrolling) {
+        s_dash_scrolling = true;
+        dash_scroll_lod(true);
+    } else if (code == LV_EVENT_SCROLL_END && s_dash_scrolling) {
+        s_dash_scrolling = false;
+        dash_scroll_lod(false);
+        if (s_dash_pending) {           /* apply the publish that arrived mid-scroll */
+            pp_dash_t *d = s_dash_pending;
+            s_dash_pending = NULL;
+            ui_apply_dashboard(d);      /* takes ownership and frees it */
+        }
+    }
+}
 
 static void update_dash_card(const dash_refs_t *r, const pp_status_t *s)
 {
@@ -1365,6 +1403,7 @@ static void make_printer_card(lv_obj_t *parent, const pp_status_t *s, int idx, d
     lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(c, on_card_clicked, LV_EVENT_CLICKED, (void *)(intptr_t)idx);
     if (!online) lv_obj_set_style_opa(c, LV_OPA_70, 0);   /* dim offline cards */
+    if (r) r->card = c;
 
     /* ---- header strip: name (white) + flush state badge (muted tint, white text) ---- */
     lv_obj_t *head = lv_obj_create(c);
@@ -1412,6 +1451,7 @@ static void make_printer_card(lv_obj_t *parent, const pp_status_t *s, int idx, d
     lv_obj_set_style_radius(thumb, 4, 0);
     lv_obj_set_style_pad_all(thumb, 0, 0);
     lv_obj_clear_flag(thumb, LV_OBJ_FLAG_SCROLLABLE);
+    if (r) r->thumb = thumb;
 
     const lv_image_dsc_t *img = model_image(s->model);
     bool has_job_thumb = (s->has_job && s->job_thumb[0]);
@@ -1757,6 +1797,9 @@ static void build_dashboard_screen(void)
     lv_obj_set_flex_flow(s_dash_grid, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(s_dash_grid, LV_FLEX_ALIGN_SPACE_EVENLY,
                           LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    /* Scroll-aware updates + LOD (defer publishes, shed thumbs/clip masks while moving). */
+    lv_obj_add_event_cb(s_dash_grid, on_dash_scroll, LV_EVENT_SCROLL_BEGIN, NULL);
+    lv_obj_add_event_cb(s_dash_grid, on_dash_scroll, LV_EVENT_SCROLL_END, NULL);
 }
 
 /* Lower rank sorts earlier when grouping by status. */
@@ -1803,6 +1846,11 @@ static int dash_order_cmp(const void *pa, const void *pb)
 void ui_apply_dashboard(void *arg)
 {
     pp_dash_t *d = (pp_dash_t *)arg;
+    if (s_dash_scrolling) {       /* mid-gesture: park the newest publish, apply on scroll end */
+        free(s_dash_pending);
+        s_dash_pending = d;
+        return;
+    }
     s_dash_count = d->count;
 
     int n = d->count; if (n > PP_MAX_PRINTERS) n = PP_MAX_PRINTERS;
