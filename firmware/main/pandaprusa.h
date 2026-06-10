@@ -3,7 +3,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define PP_FW_VERSION "0.5.0"
+/* Fork test builds: bump the last digit every test image so About / web UI / /api/info show
+ * exactly which build is flashed. NOTE: 0.4.9.x parses below upstream's v0.5.0 release, so the
+ * Firmware tab's GitHub check will offer an "update" — don't take it while testing (and leave
+ * auto-update off, its default). */
+#define PP_FW_VERSION "0.4.9.3"
 
 /* Which host API a printer speaks (auto-detected on first contact). */
 typedef enum { PP_BK_UNKNOWN = 0, PP_BK_PRUSALINK, PP_BK_MOONRAKER, PP_BK_PRUSA_CONNECT, PP_BK_BAMBU } pp_backend_t;
