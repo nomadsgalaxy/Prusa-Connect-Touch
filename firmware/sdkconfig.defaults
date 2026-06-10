@@ -61,14 +61,13 @@ CONFIG_LV_INDEV_DEF_READ_PERIOD=16
 # at zero rendering cost.
 CONFIG_PT_LVGL_RENDER_PARTIAL_1=y
 
-# Bigger CPU caches (code + font glyphs execute/live in PSRAM; these raise hit rates on exactly
-# what the renderer touches every frame, worth ~2 FPS + faster blits). CAUTION: caches are
-# carved out of internal SRAM (-48 KB) and mbedTLS needs internal RAM for cloud TLS — raising
-# them WITHOUT freeing internal RAM first broke Prusa Connect login ("Login Failed", dead cloud
-# cards). Only safe here because PARTIAL_1 above frees 128 KB (net +80 KB headroom). Keep
-# /api/info heap_internal_min comfortably positive.
-CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
-CONFIG_ESP32S3_DATA_CACHE_64KB=y
+# DO NOT raise the CPU cache sizes (ESP32S3_INSTRUCTION_CACHE_32KB / DATA_CACHE_64KB).
+# Verified twice on hardware (v0.4.9.1 with two draw buffers, v0.4.9.4 with one): the 48 KB
+# they carve out of internal SRAM starves mbedTLS, which must allocate internal RAM, and
+# Prusa Connect dies — login returns "Login Failed" and cloud printers stop reporting, while
+# plain-HTTP PrusaLink keeps working. Freeing a draw buffer did NOT compensate (pt_malloc_caps
+# falls back to PSRAM silently, so the "second internal buffer" being freed likely already
+# lived in PSRAM). The ~2 FPS the caches buy is not worth a dead cloud. They are out for good.
 
 # Snapshot-cached dashboard cards: each card renders to a PSRAM bitmap once on data change and
 # the fleet grid scrolls those bitmaps (plain blits) instead of re-rendering every widget per
